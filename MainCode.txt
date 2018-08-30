@@ -1,0 +1,421 @@
+#include <Arduino.h>   // required before wiring_private.h
+#include "wiring_private.h" //Needed to use Serial for the Bluetooth Module. Specifically for the pinPeripheral() function
+#include <TimedAction.h> //Multithreading library
+#include <QTRSensors.h> //Reflective Sensor library
+#include <Adafruit_NeoPixel.h> //Library required for RGB LED
+
+Uart SerialBluetooth (&sercom1, 11, 10, SERCOM_RX_PAD_0, UART_TX_PAD_2); //Second serial connection for Bluetooth (Pin 10 = TX, Pin 11 = RX)
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(1, 13, NEO_RGB + NEO_KHZ800); //Used to set up the RGBLED. Set up an LED stip of size 1, on pin 13
+static int BRIGHTNESS = 50; //Brightness of the LED
+
+
+//Pins
+static int PINDF = A0; //Front distance sensor PIN
+static int PINDR = A1; //Right distance sensor PIN
+#define PINRRF      A2  //Right reflectance sensor PIN
+#define PINLRF      A3  //Left reflectance sensor PIN
+static int PINLMF = 2; //Left motor forward PIN
+static int PINLMB = 3; //Left motor backward PIN
+static int PINRMF = 4; //Right motor forward PIN
+static int PINRMB = 5; //Right motor backward PIN
+static int PINEMIT = 8; //Emitter of both reflectance sensor
+static int LEDPIN = 13; //Pin for the RGB LED
+
+//Bluetooth commands
+static String DISTF = "df"; //Get front distance sensor value
+static String DISTR = "dr"; //Get right distance sensor value
+static String LMF = "lmf";  //Left motor forward
+static String LMB = "lmb";  //Left motor backward
+static String RMF = "rmf";  //Right motor forward
+static String RMB = "rmb";  //Right motor backward
+static String WALL = "wall";//Follow a wall
+static String STOP = "stop";//Disable the wallFollow and set motor speeds to 0
+static String SPEED = "speed"; //Set the max wall follow speed
+static String GAINCMD = "gain"; //Set the gain
+static String GETRF = "getrf"; //Get reflectance sensor value
+static String CALRF = "calrf"; //Calibrate reflectance sensors
+static String TIME = "time"; //Adjust the black line stop time
+
+//Threads and Thread Functions
+void wall(); //These functions have to be defined before the threads can be created
+void checkCmd();
+void stopbot();
+TimedAction wallFollow = TimedAction(10, wall); //Follow the wall thread. (Excecute function "wall" every "50" ms)
+TimedAction checkCommands = TimedAction(200, checkCmd); //Check bluetooth serial for new commands. (Excecute function "checkCmd" every "200" ms)
+
+//Global variables
+int speedLM = 0; //Speed of the left motor from 0 - 255
+int speedRM = 0; //Speed of the right motor from 0 - 255
+int setPoint = 6; //The distance set point for the wall function to follow
+//-----------------------------------------------
+#define NUMSENSORS  2 //Number of reflectance sensors
+int sampleRate = 4; //Average analog samples per sensor reading
+unsigned int sensorValues[NUMSENSORS]; //This array stores the relfective sensor values when passed to the sensor read function
+int t;
+
+//U-turn conditions
+boolean uTurn = false; //Is the bot rotating now
+boolean rFirst = false; //Check if right sensor is looking down the hall
+boolean fFirst = false; //Check if front sensor is looking down the hall
+static int TOLERANCE = 3; //As long as the distance sensors are reading +/- the TOLERANCE, trigger U-Turn conditions
+
+//Wall follow values
+double GAIN = 33; //How aggressivelly the wallFollow fucntion will corrected variations in distance from the wall
+static int MINSPEED = 0; //Minimum speed needed for motors to actually spin
+
+//Sensor values
+static int BLACKTHRESH = 70; //The minimum value to consider that a reflective sensor is looking at a black line
+int stopTime = 160; //The number of milliseconds it takes to cross a short black line
+int RFBuffer[40]; //Save the reflective sensors values in a buffer
+int RFBCount = 0; //How many sensor values have been taken so far
+boolean startBuffer = false; //If a black line is crossed, start/ stop sending sensor data
+boolean canSwitchBuffer = true; //If the sensors have moved off the black line
+boolean tcount;
+
+void SERCOM1_Handler() {
+  SerialBluetooth.IrqHandler(); //This function is required to get the 2nd UART to work (serial for Bluetooth). Just include it.
+}
+
+QTRSensorsAnalog qtra((unsigned char[]) {PINLRF, PINRRF}, NUMSENSORS, sampleRate, PINEMIT); //This sets up the qtra function to read the sensor values. 
+//qtra ({Sensor pin, Sensor pin}, Number of sensors, sample rate, pin used for emitting a pulse to the reflective sensors);
+
+
+void setup() { //This function runs once at start up.
+  SerialUSB.begin(115200); //Set baud rate of the USB serial connection
+  SerialBluetooth.begin(115200); //Set the baud rate of the serial connection to the Bluesmirf
+
+  //Assign pins 10 & 11 SERCOM functionality for bluetooth serial communication. This has to be placed after SerialBluetooth.begin(115200);
+  pinPeripheral(10, PIO_SERCOM);
+  pinPeripheral(11, PIO_SERCOM);
+
+  pixels.begin(); // This initializes the RGBLED library.
+  pixels.setBrightness(BRIGHTNESS); //Set the max brightness of the LED to reduce Voltage drop
+  pixels.show();
+  pixels.setPixelColor(0, pixels.Color(0,0,0)); //Default the LED off (only turns on when collecting data)
+  pixels.show();
+
+  //Set the pin modes to be either input or output
+  pinMode(PINDF, INPUT);
+  pinMode(PINDR, INPUT);
+
+  pinMode(PINLMF, OUTPUT);
+  pinMode(PINLMB, OUTPUT);
+  pinMode(PINRMF, OUTPUT);
+  pinMode(PINRMB, OUTPUT);
+
+  for(int x = 0; x < 20; x++){ //Initialize the RFBuffer to all 0's
+    RFBuffer[x] = 0;
+  }
+
+  wallFollow.disable(); //Don't run the wall function until bluetooth commands it to
+}
+
+void loop() { //This function loops infinitly
+  checkCommands.check(); //Run command checker thread
+  wallFollow.check(); //Run wall follow thread
+}
+
+void stopbot() {
+      //stops bot
+      wallFollow.disable(); //Kill the wallFollow thread
+      speedLM = 0;
+      speedRM = 0;
+      uTurn = false;
+      analogWrite(PINLMF, speedLM);
+      analogWrite(PINRMF, speedRM);
+      analogWrite(PINLMB, 0);
+      analogWrite(PINRMB, 0);
+
+      SerialBluetooth.print("BOT STOPPED\n\r");
+}
+
+void wall() {
+  int adjust = (int) (convertDist(analogRead(PINDR)) - setPoint) * GAIN; //Reduce speed of motor to adjust physical distance to the wall
+
+  //Check if U-Turn is needed
+  if ((convertDist(analogRead(PINDF)) - setPoint) < 0 && uTurn == false) { //If the right and front sensors are closer then the setpoint
+    //SerialBluetooth.print("\n\rStarting U-Turn. Looking for right to point down a hall. \r\n");
+    uTurn = true;
+    rFirst = false; 
+    //fFirst = false; 
+    
+    analogWrite(PINRMF, speedLM); //Set the right motor to be the negative speed of the left motor to rotate the bot counter-clockwise
+    analogWrite(PINRMB, 0);
+    analogWrite(PINLMB, speedLM); 
+    analogWrite(PINLMF, 0);
+  }
+
+  if(uTurn == true){ //If the bot is now turning around
+    if((convertDist(analogRead(PINDF)) - setPoint) > 12){ //If the front sensor is looking down the hall
+      //SerialBluetooth.print("Front sensor looking down hall. Continuing PID. \r\n");
+      uTurn = false; //Stop U-Turning
+
+      analogWrite(PINRMB, 0); //Turn off the backwards motor pins
+      analogWrite(PINLMB, 0); //Both turned off for robustness
+    }
+  }
+  
+
+  if (uTurn == false) { //See if the robot is not U-Turning
+  //Make sure adjust doesn't reduce the motor speeds below MINSPEED
+  if (adjust > speedLM - MINSPEED) {
+      adjust = speedLM - MINSPEED;
+    }
+    if (adjust < -speedRM + MINSPEED) {
+      adjust = -speedRM + MINSPEED;
+    }
+
+    if (adjust > 0) { //If the bot is too far from the wall
+      analogWrite(PINLMF, speedLM);
+      analogWrite(PINRMF, (speedRM -  adjust)); //Slow down the right motor to turn right
+
+      
+      //SerialBluetooth.print("\rLeft Motor Speed: "); //The "\r" resets the terminal to the left without making a new line, for clean output
+      //SerialBluetooth.print(speedLM);
+      //SerialBluetooth.print(" Right Motor Speed: ");
+      //SerialBluetooth.print(speedRM - adjust);
+
+    } else { //If the bot is too close to the wall
+      analogWrite(PINLMF, speedLM + adjust); //Slow down the left motor to turn right ("adjust" is negative here)
+      analogWrite(PINRMF, speedRM);
+
+      //SerialBluetooth.print("\rLeft Motor Speed: ");
+      //SerialBluetooth.print(speedLM + adjust);
+      //SerialBluetooth.print(" Right Motor Speed: ");
+      //SerialBluetooth.print(speedRM);
+    }
+  }
+
+  //Reflective Sensor Buffer send 
+  int tmp = readRRF();
+
+  if ((tcount == true) && (tmp > BLACKTHRESH) && (millis() >= t)) { //If the bot has gone over a long black line. Stop the bot
+    stopbot();  
+    tcount = false; //Reset the time counter
+    RFBufferSend(true, 0); //Send whats in the buffer
+    startBuffer = false; //Stop filling buffer
+    setLEDColor(0,0,0); //Turn off LED
+    SerialBluetooth.print("Stopping bot on thick black line");
+    SerialBluetooth.print(stopTime);
+    SerialBluetooth.print("\n\r");
+  }
+  
+  if((tmp > BLACKTHRESH) && (canSwitchBuffer == true)){
+    canSwitchBuffer = false;
+    if(startBuffer == true){
+      RFBufferSend(true, 0); //Send whats in the buffer
+      startBuffer = false; //Stop filling buffer
+      //SerialBluetooth.print("Stop sending reflective sensor data\n\r");
+      setLEDColor(0,0,0); //Turn off LED
+      //------------------------------
+      tcount = true;
+      
+      t = millis() + stopTime; //Tweak this value for timing
+      
+    }else{
+      startBuffer = true;
+      setLEDColor(0,0,255); //Set LED to blue
+      //SerialBluetooth.print("Start sending reflective sensor data\n\r");
+      tcount = true;
+      
+      t = millis() + stopTime; //Tweak this value for timing
+    }
+  }
+  if(tmp < BLACKTHRESH){ //If the sensor is off the black line
+    canSwitchBuffer = true;
+    //--------------------
+    tcount = false;
+  }
+  
+  if(startBuffer == true){ //Read/ send reflective sensor values
+    RFBufferSend(false, analogRead(PINDR));
+  }
+  
+}
+
+
+
+void checkCmd() { //Check the bluetooth serial connection for new commands
+  if (SerialBluetooth.available()) { // If the SerialBluetooth sent any characters
+    String cmd = SerialBluetooth.readStringUntil(' '); //Add characters to a string. " " defines the end of a command
+    SerialUSB.print(cmd); // Take any characters from the SerialBluetooth and prints to the USB serial monitor
+
+    if (cmd.equals(DISTF)) { //Read front sensor distance
+      SerialBluetooth.print("Front distance (cm): ");
+      SerialBluetooth.print(convertDist(analogRead(PINDF)));
+      SerialBluetooth.print("\n\r"); //"\n" Moves the terminal to a new line. "\r" Moves the terminal to the left of the line. Needed for proper new line
+    }
+    if (cmd.equals(DISTR)) { //Read right sensor distance
+      SerialBluetooth.print("Right distance (cm): ");
+      SerialBluetooth.print(convertDist(analogRead(PINDR)));
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.substring(0, 3).equals(LMF)) { //Left motor forward at XXX% speed
+      speedLM = cmd.substring(3, 6).toInt(); //Read speed of the motor
+      speedLM = (int) (((double) speedLM / 100.0) * 255.0); //Convert the percent to 8 bit (0-255)
+      analogWrite(PINLMF, speedLM);
+      analogWrite(PINLMB, 0); //Turn off the backwards pin
+
+      SerialBluetooth.print("Left Motor Foward. Speed: ");
+      SerialBluetooth.print(speedLM);
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.substring(0, 3).equals(LMB)) { //Left motor backward
+      int mspeed = cmd.substring(3, 6).toInt(); //Speed of the motor
+      mspeed = (int) (((double) mspeed / 100.0) * 255.0); //Convert the percent to 8 bit (0-255)
+      analogWrite(PINLMB, mspeed);
+      analogWrite(PINLMF, 0); //Turn off the forwards pin
+
+      SerialBluetooth.print("Left Motor Backward. Speed: ");
+      SerialBluetooth.print(mspeed);
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.substring(0, 3).equals(RMF)) { //Right motor forward
+      speedRM = cmd.substring(3, 6).toInt(); //Speed of the motor
+      speedRM = (int) (((double) speedRM / 100.0) * 255.0); //Convert the percent to 8 bit (0-255)
+      analogWrite(PINRMF, speedRM);
+      analogWrite(PINRMB, 0); //Turn off the backwards pin
+
+      SerialBluetooth.print("Right Motor Foward. Speed: ");
+      SerialBluetooth.print(speedRM);
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.substring(0, 3).equals(RMB)) { //Right motor backward
+      int mspeed = cmd.substring(3, 6).toInt(); //Speed of the motor
+      mspeed = (int) (((double) mspeed / 100.0) * 255.0); //Convert the percent to 8 bit (0-255)
+      analogWrite(PINRMB, mspeed);
+      analogWrite(PINRMF, 0); //Turn off the forwards pin
+
+      SerialBluetooth.print("Right Motor Backward. Speed: ");
+      SerialBluetooth.print(mspeed);
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.substring(0, 4).equals(WALL)) { //Start following the wall at XXX cm distance away
+      setPoint = cmd.substring(4, 7).toInt(); //Read the setpoint from the bluetooth command
+      if (speedLM == 0) {
+        speedLM = 250; //Set speed to maximum
+        speedRM = 250;
+      }
+      analogWrite(PINLMF, speedLM);
+      analogWrite(PINRMF, speedRM);
+      wallFollow.enable(); //Start the wall follow thread
+
+      SerialBluetooth.print("Starting wall follow at set point: ");
+      SerialBluetooth.print(cmd.substring(4, 7).toInt());
+      SerialBluetooth.print(" (cm)\n\r");
+    }
+    if (cmd.equals(STOP)) { //Stop the bot
+      stopbot();
+    }
+    if (cmd.substring(0, 5).equals(SPEED)) { //Set the wall follow max speed to XXX
+      int s = cmd.substring(5, 8).toInt(); //Read the max speed
+      if (s > 255) {
+        SerialBluetooth.print("Error speed too high!\n\r");
+        return;
+      }
+      if (s < MINSPEED) {
+        SerialBluetooth.print("Speed below MINSPEED!\n\r");
+        return;
+      }
+
+      speedLM = speedRM = s;
+
+      SerialBluetooth.print("Wall follow speed: ");
+      SerialBluetooth.print(s);
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.substring(0, 4).equals(GAINCMD)) { //Set the gain to XXX
+      GAIN = cmd.substring(4, 7).toInt(); //Read the max speed
+      SerialBluetooth.print("Gain: ");
+      SerialBluetooth.print(GAIN);
+      SerialBluetooth.print("\n\r");
+    }
+    if (cmd.equals(GETRF)) { //Get the values for the reflective sensors
+      qtra.read(sensorValues); // read calibrated sensor values and obtain a measure of the line position from 0 to 1000
+      SerialBluetooth.print("Reflectance: Left: ");
+      SerialBluetooth.print(sensorValues[0]);
+      SerialBluetooth.print(" Right: ");
+      SerialBluetooth.print(sensorValues[1]);
+      SerialBluetooth.print("\n\r");
+      
+      // print the sensor values as numbers from 0 to 1000, where 0 means maximum reflectance and 1000 means minimum reflectance
+
+    }
+    if (cmd.equals(CALRF)) { //Calibrate the reflective sensors
+      digitalWrite(13, HIGH);    // turn on Arduino's LED to indicate we are in calibration mode
+      for (int i = 0; i < 400; i++)  // make the calibration take about 10 seconds
+      {
+        qtra.calibrate();       // reads all sensors 10 times at 2.5 ms per six sensors (i.e. ~25 ms per call)
+      }
+      digitalWrite(13, LOW);     // turn off Arduino's LED to indicate we are through with calibration
+      // print the calibration minimum values measured when emitters were on
+      SerialBluetooth.print("Reflectance Mins: Left: ");
+      SerialBluetooth.print(qtra.calibratedMinimumOn[0]);
+      SerialBluetooth.print(" Right: ");
+      SerialBluetooth.print(qtra.calibratedMinimumOn[1]);
+      SerialBluetooth.print("\n\r");
+  
+      // print the calibration maximum values measured when emitters were on
+      SerialBluetooth.print("Reflectance Mins: Left: ");
+      SerialBluetooth.print(qtra.calibratedMaximumOn[0]);
+      SerialBluetooth.print(" Right: ");
+      SerialBluetooth.print(qtra.calibratedMaximumOn[1]);
+      SerialBluetooth.print("\n\r");   
+      }
+      if(cmd.substring(0, 4).equals(TIME)) { //Set the stop time to XXX
+        stopTime = cmd.substring(4, 7).toInt();
+        
+        SerialBluetooth.print("Stop time set to: ");
+        SerialBluetooth.print(stopTime);
+        SerialBluetooth.print("\r\n");
+      }
+    }
+
+ 
+    
+  if (SerialUSB.available()) { // If stuff was typed in the serial monitor send it to the SerialBluetooth (for testing connection)
+    // Send any characters the Serial monitor prints to the SerialBluetooth
+    char tmp = (char) SerialUSB.read();
+    SerialUSB.print(tmp);
+    SerialBluetooth.print(tmp);
+  }
+  
+  
+}
+
+int convertDist(double inputValue) { //This function converts the analog value from the distance sensors to cm
+  return (int) (4095.0 / inputValue);
+}
+
+int readRRF(){ //Return the value for the right reflective sensor
+  qtra.read(sensorValues);
+  return sensorValues[1];
+}
+
+void RFBufferSend(boolean sendAnyway, int errorValue){ //This function stores the reflective sensor values and sends them when neccessary. If sendAnyway == true, send all in buffer
+  if(RFBCount >= 40 || sendAnyway){
+    setLEDColor(0,255,0);
+    for(int x = 0; x < 40; x += 2){ //Skip every other sensor value
+      SerialBluetooth.print(RFBuffer[x]);
+      SerialBluetooth.print(" ");
+      RFBuffer[x] = 0; //Clear the buffer as sent
+      RFBuffer[x + 1] = 0;
+    }
+    SerialBluetooth.print("\r\n");
+    RFBCount = 0;
+    delay(25);//Small delay so humans can see the green transmission color
+    setLEDColor(0,0,255);
+  }else{
+    RFBuffer[RFBCount] = errorValue;
+    RFBCount++;
+  }
+  
+}
+
+void setLEDColor(int red, int green, int blue){
+  pixels.setPixelColor(0, pixels.Color(red,green,blue)); //Set pixel 0 to color (RED, GREEN, BLUE)
+  
+  pixels.show(); //This applies the LED color/ brigtness changes
+}
+
